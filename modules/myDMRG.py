@@ -1,12 +1,18 @@
 # Module for myDMRG
 
 import numpy as np
+from tqdm import tqdm
 
 from tenpy.linalg import np_conserved as npc
 from tenpy.linalg.lanczos import lanczos
 from tenpy.linalg.sparse import NpcLinearOperator
 from tenpy.algorithms.truncation import svd_theta
+from tenpy.networks.mps import MPS
+from tenpy.models.model import CouplingMPOModel
+from tenpy.networks.site import BosonSite
 
+
+# DMRG ENGINE
 class SimpleDMRGEngine_Boson:
     """DMRG algorithm, implemented as class holding the necessary data.
 
@@ -21,7 +27,7 @@ class SimpleDMRGEngine_Boson:
         
     Parameters
     ----------
-    psi, model, chi_max, eps:
+    psi, model, chi_max:
         See attributes
 
     Attributes
@@ -30,34 +36,34 @@ class SimpleDMRGEngine_Boson:
         The current ground-state (approximation).
     model :
         The model of which the groundstate is to be calculated.
-    chi_max, eps:
-        Truncation parameters, see :func:`a_mps.split_truncate_theta`.
-    LPs, RPs : list of np.Array[ndim=3]
+    chi_max:
+        Truncation parameter.
+    LPs, RPs : list of npc.Array
         Left and right parts ("environments") of the effective Hamiltonian.
         ``LPs[i]`` is the contraction of all parts left of site `i` in the network ``<psi|H|psi>``,
         and similar ``RPs[i]`` for all parts right of site `i`.
-        Each ``LPs[i]`` has legs ``vL wL* vL*``, ``RPS[i]`` has legs ``vR* wR* vR``
+        Each ``LPs[i]`` has legs ``vR wR vR*``, ``RPs[i]`` has legs ``vL wL vL*``
+    Es : list of floats
+        Energies of the ground state computed in each sweep
     """
-    def __init__(self, psi, model, chi_max, eps):
-        
-        #assert psi.L == model.lat.mps_sites() #and psi.bc == model.bc  # ensure compatibility
+    def __init__(self, psi, model, chi_max):
         
         self.H_mpo = model.H_MPO
         self.psi = psi
         self.LPs = [None] * psi.L
         self.RPs = [None] * psi.L
         self.chi_max = chi_max
-        self.eps = eps
-        #self.Es = []
+        self.Es = []
         
         # initialize left and right environment
-        D = self.H_mpo.dim[0]   # IS IT CORRECT?
+        DL = self.H_mpo.get_W(0).shape[0]
+        DR = self.H_mpo.get_W(-1).shape[1]
         chi = psi._B[0].shape[0]
         
-        LP = np.zeros([chi, D, chi], dtype=float)  # vR wR vR*
-        RP = np.zeros([chi, D, chi], dtype=float)  # vL* wL vL
+        LP = np.zeros([chi, DL, chi], dtype=float)  # vR wR vR*
+        RP = np.zeros([chi, DR, chi], dtype=float)  # vL* wL vL
         LP[:, 0, :] = np.eye(chi)
-        RP[:, D - 1, :] = np.eye(chi)
+        RP[:, DR - 1, :] = np.eye(chi)
         self.LPs[0] = npc.Array.from_ndarray(data_flat=LP, 
                                              legcharges=[self.psi._B[0].conj().get_leg('vL*'), # should have conj and then taken 'vL'
                                                          self.H_mpo.get_W(0).conj().get_leg('wL*'),
@@ -73,19 +79,17 @@ class SimpleDMRGEngine_Boson:
         for i in range(psi.L - 1, 1, -1):
             self.update_RP(i)
 
-    def sweep(self):
+    def sweep(self, desc_prog):
         
         EL = ER = 0
         # sweep from left to right
-        for i in range(self.psi.L - 2): # 
+        for i in tqdm(range(self.psi.L - 2), leave=False, desc=str(desc_prog)+'# right sweep'): # 
             #print(i)
             EL += self.update_bond(i)
-            
         # sweep from right to left
-        for i in range(self.psi.L - 2, 0, -1):
+        for i in tqdm(range(self.psi.L - 2, 0, -1), leave=False, desc=str(desc_prog)+'# left sweep'):
             ER += self.update_bond(i)
-        
-        print(EL, ER)
+        return((EL+ER)/(2*(self.psi.L - 2)))
 
     def update_bond(self, i):
         
@@ -97,12 +101,16 @@ class SimpleDMRGEngine_Boson:
         # Get theta
         th = self.psi.get_theta(i, n=2)
         
-        # Contract with environment
-        #th = self.Heff.matvec(th)
-        #th = th.combine_legs([['vL', 'p0'], ['p1', 'vR']], qconj=[+1, -1]) # map to 2D
         
         # Diagonalize & find ground state
-        E, th, N = lanczos(self.Heff,th)
+        lanczos_params = {
+            'cutoff':0.001,
+            'E_tol': 1.e-10,
+            'N_cache':10,
+            'N_min':10,
+            'reortho':True
+        }
+        E, th, N = lanczos(self.Heff, th, lanczos_params)
         
         th = th.combine_legs([['vL', 'p0'], ['p1', 'vR']], qconj=[+1, -1]) # map to 2D
         old_A = self.psi.get_B(i, form='A')
@@ -150,8 +158,26 @@ class SimpleDMRGEngine_Boson:
         LP = npc.tensordot(Ac, LP, axes=(('vL*', 'p*'), ('vR*', 'p')))  # [vL*] [p*] vR*, vR [p] [vR*] wR
         self.LPs[j] = LP  # vR* wR vR (== vL wL* vL* on site i+1)
 
-        
-        
+    def run(self, params):
+        self.max_sweep = params.get('max_sweep', 5)
+        self.eps = params.get('eps', 1e-3)
+        self.V = params.get('V', 1e-6)
+        sweep_counter = 0
+        last_last_E = 2e10
+        last_E = 1e10
+        e_counter = 0
+        while True:
+            sweep_counter += 1
+            if (sweep_counter > self.max_sweep): break
+            if (e_counter > 2): break
+            last_last_E = last_E
+            last_E = self.sweep(sweep_counter)
+            self.Es.append(last_E)
+            if (abs(last_E - last_last_E) <= self.eps*self.V):
+                e_counter +=1
+
+                
+# EFFECTVE HAMITONIAN        
 class TwoSiteH(NpcLinearOperator):
     r"""Class defining the two-site effective Hamiltonian for Lanczos.
     The effective two-site Hamiltonian looks like this::
@@ -160,42 +186,14 @@ class TwoSiteH(NpcLinearOperator):
             |       LP----W0--W1---RP
             |        |    |   |    |
             |        .---       ---.
-    If `combine` is True, we define `LHeff` and `RHeff`, which are the contractions of `LP` with
-    `W0`, and `RP` with `W1`, respectively.
     Parameters
     ----------
-    env : :class:`~tenpy.networks.mpo.MPOEnvironment`
-        Environment for contraction ``<psi|H|psi>``.
+    eng : :class:`~SimpleDMRGEngine_Boson`
+        Engine that we defined
     i0 : int
         Left-most site of the MPS it acts on.
-    combine : bool
-        Whether to combine legs into pipes. This combines the virtual and
-        physical leg for the left site (when moving right) or right side (when moving left)
-        into pipes. This reduces the overhead of calculating charge combinations in the
-        contractions, but one :meth:`matvec` is formally more expensive, :math:`O(2 d^3 \chi^3 D)`.
-    move_right : bool
-        Whether the the sweep is moving right or left for the next update.
-        Ignored for the :class:`TwoSiteH`.
     Attributes
     ----------
-    i0 : int
-        Left-most site of the MPS it acts on.
-    combine : bool
-        Whether to combine legs into pipes. This combines the virtual and
-        physical leg for the left site and right site into pipes. This reduces
-        the overhead of calculating charge combinations in the contractions,
-        but one :meth:`matvec` is formally more expensive, :math:`O(2 d^3 \chi^3 D)`.
-    length : int
-        Number of (MPS) sites the effective hamiltonian covers.
-    acts_on : list of str
-        Labels of the state on which `self` acts. NB: class attribute.
-        Overwritten by normal attribute, if `combine`.
-    LHeff : :class:`~tenpy.linalg.np_conserved.Array`
-        Left part of the effective Hamiltonian.
-        Labels ``'(vR*.p0)', 'wR', '(vR.p0*)'`` for bra, MPO, ket.
-    RHeff : :class:`~tenpy.linalg.np_conserved.Array`
-        Right part of the effective Hamiltonian.
-        Labels ``'(p1*.vL)', 'wL', '(p1.vL*)'`` for ket, MPO, bra.
     LP, W0, W1, RP : :class:`~tenpy.linalg.np_conserved.Array`
         Tensors making up the network of `self`.
     """
@@ -219,7 +217,7 @@ class TwoSiteH(NpcLinearOperator):
         Parameters
         ----------
         theta : :class:`~tenpy.linalg.np_conserved.Array`
-            Labels: ``vL, p0, p1, vR`` if combine=False, ``(vL.p0), (p1.vR)`` if True
+            Labels: ``vL, p0, p1, vR`` 
         Returns
         -------
         theta :class:`~tenpy.linalg.np_conserved.Array`
@@ -233,3 +231,88 @@ class TwoSiteH(NpcLinearOperator):
         theta.ireplace_labels(['vR*', 'vL*'], ['vL', 'vR'])
         theta.itranspose(labels)  # if necessary, transpose
         return theta
+    
+
+# MPO MODEL
+class myModel(CouplingMPOModel):
+    
+    def init_sites(self, model_params):
+        n_max = model_params.get('n_max', 0)
+        filling = model_params.get('filling', 0)
+        conserve = model_params.get('conserve', 'N')
+        #if conserve == 'best':
+        #    conserve = 'N'
+        #    self.logger.info("%s: set conserve to %s", self.name, conserve)
+        site = BosonSite(Nmax=n_max, conserve=conserve, filling=filling)
+        return site
+
+    def init_terms(self, model_params):
+        # 0) Read and set parameters.
+        rc = model_params.get('rc', 0)
+        t = model_params.get('t', 1.)
+        U = model_params.get('U', 0.)
+        V = model_params.get('V', 0.)
+        mu = model_params.get('mu', 0)
+        ryd = model_params.get('ryd', False)
+        for u1, u2, dx in self.lat.pairs['nearest_neighbors']:
+            self.add_coupling(-t, u1, 'Bd', u2, 'B', dx, plus_hc=True)
+        if ryd:
+            for dx in range(1,2*(rc+1)):
+                self.add_coupling(V/(1+(dx/rc)**6), 0, 'N', 0, 'N', dx)
+        else:
+            for dx in range(1,rc+1):
+                self.add_coupling(V, 0, 'N', 0, 'N', dx)
+                
+                
+# FUNCTIONS
+def structure_factor(k, psi, model_params):
+    
+    L = model_params.get('L', 0)
+    corr_matrix = psi.correlation_function('dN','dN')
+    res = 0 
+    j = 0+1j
+    for ii in range(L):
+        for jj in range(L):
+            res += (corr_matrix[ii,jj]/L) * np.exp(j*k*(ii-jj))
+    return res
+
+def g_2(psi, model_params):
+    L = model_params.get('L', 0)
+    corr_matrix = psi.correlation_function('N','N')
+    out = np.zeros(L)
+    norm = np.zeros(L)
+    for ii in range(L):
+        for jj in range(L):
+            out[abs(ii-jj)] += corr_matrix[ii,jj]
+            norm[abs(ii-jj)] += 1
+    return out/norm
+
+def B_1(psi, model_params):
+    L = model_params.get('L', 0)
+    corr_matrix = psi.correlation_function('Bd','B')
+    out = np.zeros(L-1)
+    norm = np.zeros(L-1)
+    for jj in range(L):
+        out[abs(1-jj)] += corr_matrix[1,jj]
+        norm[abs(1-jj)] += 1
+    return out/norm
+
+def E_k(k, psi, model_params):
+    L = model_params.get('L', 0)
+    t = model_params.get('t', 0)
+    corr_matrix = psi.correlation_function('Bd','B') + psi.correlation_function('B','Bd')
+    res = 0
+    for ii in range(L):
+        res += corr_matrix[ii,(ii+1)%L]
+    return res*(1 - np.cos(2*np.pi*k/L))*t/L
+
+def n_k(k, psi, model_params):
+    
+    L = model_params.get('L', 0)
+    corr_matrix = psi.correlation_function('Bd','B')
+    res = 0 
+    j = 0+1j
+    for ii in range(L):
+        for jj in range(L):
+            res += (corr_matrix[ii,jj]/L) * np.exp(j*k*(ii-jj))
+    return res
