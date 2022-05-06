@@ -24,7 +24,7 @@ class SimpleDMRGEngine_Boson:
         |                 |               |
         |                 ^               |
         .-<-vR*           p         vL*-<-.
-        
+
     Parameters
     ----------
     psi, model, chi_max:
@@ -47,40 +47,40 @@ class SimpleDMRGEngine_Boson:
         Energies of the ground state computed in each sweep
     """
     def __init__(self, psi, model, chi_max):
-        
+
         self.H_mpo = model.H_MPO
         self.psi = psi
         self.LPs = [None] * psi.L
         self.RPs = [None] * psi.L
         self.chi_max = chi_max
         self.Es = []
-        
+
         # initialize left and right environment
         DL = self.H_mpo.get_W(0).shape[0]
         DR = self.H_mpo.get_W(-1).shape[1]
         chi = psi._B[0].shape[0]
-        
+
         LP = np.zeros([chi, DL, chi], dtype=float)  # vR wR vR*
         RP = np.zeros([chi, DR, chi], dtype=float)  # vL* wL vL
         LP[:, 0, :] = np.eye(chi)
         RP[:, DR - 1, :] = np.eye(chi)
-        self.LPs[0] = npc.Array.from_ndarray(data_flat=LP, 
+        self.LPs[0] = npc.Array.from_ndarray(data_flat=LP,
                                              legcharges=[self.psi._B[0].conj().get_leg('vL*'),
                                                          self.H_mpo.get_W(0).conj().get_leg('wL*'),
                                                          self.psi._B[0].get_leg('vL')],
                                                          labels=['vR', 'wR', 'vR*'])
-        self.RPs[-1] = npc.Array.from_ndarray(data_flat=RP, 
-                                             legcharges=[self.psi._B[-1].get_leg('vR'), 
+        self.RPs[-1] = npc.Array.from_ndarray(data_flat=RP,
+                                             legcharges=[self.psi._B[-1].get_leg('vR'),
                                                          self.H_mpo.get_W(-1).conj().get_leg('wR*'),
                                                          self.psi._B[-1].conj().get_leg('vR*')],
                                                          labels=['vL*', 'wL', 'vL'])
-        
+
         # initialize necessary RPs
         for i in range(psi.L - 1, 1, -1):
             self.update_RP(i)
 
     def sweep(self, desc_prog):
-        
+
         EL = ER = 0
         # sweep from left to right
         for i in tqdm(range(self.psi.L - 2), leave=False, desc=str(desc_prog)+'# right sweep'):
@@ -91,13 +91,13 @@ class SimpleDMRGEngine_Boson:
         return((EL+ER)/(2*(self.psi.L - 2)))
 
     def update_bond(self, i):
-        
+
         j = (i + 1) % self.psi.L
-        
+
         self.Heff = TwoSiteH(self, i)# Build Heff
-        
+
         th = self.psi.get_theta(i, n=2)# Get theta
-        
+
         # Diagonalize & find ground state
         lanczos_params = {
             'cutoff':0.001,
@@ -107,12 +107,12 @@ class SimpleDMRGEngine_Boson:
             'reortho':True
         }
         E, th, N = lanczos(self.Heff, th, lanczos_params)
-        
+
         th = th.combine_legs([['vL', 'p0'], ['p1', 'vR']], qconj=[+1, -1]) # map to 2D
         old_A = self.psi.get_B(i, form='A')
         U, S, VH, err, renormalize = svd_theta(th,{'chi_max' : self.chi_max},
                                                qtotal_LR=[old_A.qtotal, None],inner_labels=['vR','vL'])
-        
+
         # Manipulate and put back into MPS
         U.ireplace_label('(vL.p0)', '(vL.p)')
         VH.ireplace_label('(p1.vR)', '(p.vR)')
@@ -121,7 +121,7 @@ class SimpleDMRGEngine_Boson:
         self.psi.set_B(i, A, form='A')
         self.psi.set_B(i+1, B, form='B')
         self.psi.set_SR(i, S)
-        
+
         # Update Environment
         self.update_LP(i)
         self.update_RP(j)
@@ -141,7 +141,7 @@ class SimpleDMRGEngine_Boson:
 
     def update_LP(self, i):
         """Calculate LP left of site `i+1` from LP left of site `i`."""
-        
+
         j = (i + 1) % self.psi.L
         LP = self.LPs[i]  # vR wR vR*
         A = self.psi.get_B(i, form='A')  # vL p vR
@@ -170,10 +170,26 @@ class SimpleDMRGEngine_Boson:
             if (abs(last_E - last_last_E) <= self.eps*self.V):
                 e_counter +=1
 
-                
-# EFFECTVE HAMITONIAN        
+
+# EFFECTVE HAMITONIAN
 class TwoSiteH(NpcLinearOperator):
-    
+    """The effective two-site Hamiltonian looks like this:
+            |        .---       ---.
+            |        |    |   |    |
+            |       LP----W0--W1---RP
+            |        |    |   |    |
+            |        .---       ---.
+    Parameters
+    ----------
+    eng : :class:`~SimpleDMRGEngine_Boson`
+        Engine that we defined
+    i0 : int
+        Left-most site of the MPS it acts on.
+    Attributes
+    ----------
+    LP, W0, W1, RP : :class:`~tenpy.linalg.np_conserved.Array`
+        Tensors making up the network of `self`.
+    """
     length = 2
     acts_on = ['vL', 'p0', 'p1', 'vR']
 
@@ -185,9 +201,9 @@ class TwoSiteH(NpcLinearOperator):
         self.W1 = eng.H_mpo.get_W(i0 + 1).replace_labels(['p', 'p*'], ['p1', 'p1*'])
         # 'wL', 'wR', 'p1', 'p1*'
         self.dtype = eng.H_mpo.dtype
-        
+
     def matvec(self, theta):
-       
+
         labels = theta.get_leg_labels()
         theta = npc.tensordot(self.LP, theta, axes=['vR', 'vL'])
         theta = npc.tensordot(self.W0, theta, axes=[['wL', 'p0*'], ['wR', 'p0']])
@@ -196,11 +212,11 @@ class TwoSiteH(NpcLinearOperator):
         theta.ireplace_labels(['vR*', 'vL*'], ['vL', 'vR'])
         theta.itranspose(labels)
         return theta
-    
+
 
 # MPO MODEL
 class myModel(CouplingMPOModel):
-    
+
     def init_sites(self, model_params):
         n_max = model_params.get('n_max', 0)
         filling = model_params.get('filling', 0)
@@ -221,14 +237,14 @@ class myModel(CouplingMPOModel):
         else:
             for dx in range(1,rc+1):
                 self.add_coupling(V, 0, 'N', 0, 'N', dx)
-                
-                
+
+
 # FUNCTIONS
 def structure_factor(k, psi, model_params):
-    
+
     L = model_params.get('L', 0)
     corr_matrix = psi.correlation_function('dN','dN')
-    res = 0 
+    res = 0
     j = 0+1j
     for ii in range(L):
         for jj in range(L):
@@ -266,10 +282,10 @@ def E_k(k, psi, model_params):
     return res*(1 - np.cos(2*np.pi*k/L))*t/L
 
 def n_k(k, psi, model_params):
-    
+
     L = model_params.get('L', 0)
     corr_matrix = psi.correlation_function('Bd','B')
-    res = 0 
+    res = 0
     j = 0+1j
     for ii in range(L):
         for jj in range(L):
